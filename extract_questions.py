@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Extract road-exam questions from PDFs: text + per-question PNG clips.
 
-Strategy: identify individual question *cells* on each page first (using
-PDF drawing rectangles anchored by 'отв' answer markers), then extract
-and parse text within each cell independently.  This guarantees that the
-question text and the clipped image always come from the same cell.
+Russian PDFs use boxed cells anchored by 'отв' markers — extracted with
+cell detection.  All other languages use a page-flow format with a
+language-specific answer marker on its own line.
 """
 from __future__ import annotations
 
@@ -17,14 +16,42 @@ import fitz
 
 ROOT = Path(__file__).resolve().parent
 PDF_DIR = ROOT / "pdfs"
-OUT_JSON = ROOT / "questions.json"
+QUESTIONS_DIR = ROOT / "questions"
 MEDIA_DIR = ROOT / "media"
-ANS_LINE = re.compile(r"отв\s*[^\d\n]*(\d+)\s*$", re.UNICODE)
+
+# Russian patterns (used by cell-based extractor)
+ANS_LINE = re.compile(r"отв\s*[^\d\n]*(\d+)\s*$", re.UNICODE | re.IGNORECASE)
 OPT_LINE = re.compile(r"^\s*(\d+)\.(.+)$")
+
+# Per-language config
+#   ans_search  – literal string passed to page.search_for() for image clipping
+#   ans_re      – regex whose group(1) gives the 1-based correct answer index
+#   opt_re      – regex that matches one option line
+#   use_cells   – True only for Russian (boxed cell layout)
+LANG_CONFIG: dict[str, dict] = {
+    "ru": {
+        "ans_search": "отв",
+        "ans_re":     ANS_LINE,
+        "opt_re":     OPT_LINE,
+        "use_cells":  True,
+    },
+    "am": {
+        "ans_search": "Պատ",
+        "ans_re":     re.compile(r"Պատ[^\d]*(\d+)\s*$", re.UNICODE),
+        "opt_re":     re.compile(r"^\s*(\d+)\.(.*)$", re.UNICODE),
+        "use_cells":  True,
+    },
+    "en": {
+        "ans_search": "Ans",
+        "ans_re":     re.compile(r"Ans[^\d]*(\d+)\s*$", re.UNICODE),
+        "opt_re":     re.compile(r"^\s*(\d+)\.(.*)$", re.UNICODE),
+        "use_cells":  True,
+    },
+}
 
 
 # ---------------------------------------------------------------------------
-# Text parsing (works on text from a single cell OR a full page)
+# Russian cell-based parsing (unchanged)
 # ---------------------------------------------------------------------------
 
 def expand_merged_option_lines(lines: list[str]) -> list[str]:
@@ -41,13 +68,11 @@ def expand_merged_option_lines(lines: list[str]) -> list[str]:
     return out
 
 
-def parse_cell_text(text: str) -> dict | None:
-    """Parse a single question from *one cell's* text.  Returns the first
-    valid question dict or ``None``."""
+def parse_cell_text(text: str, ans_re: re.Pattern = ANS_LINE) -> dict | None:
     lines = [ln.rstrip() for ln in text.splitlines()]
     buf: list[str] = []
     for line in lines:
-        m = ANS_LINE.search(line)
+        m = ans_re.search(line)
         if m:
             ans = int(m.group(1))
             pre = line[: m.start()].rstrip()
@@ -88,7 +113,6 @@ def parse_cell_text(text: str) -> dict | None:
 
 
 def parse_page_text(text: str) -> list[dict]:
-    """Legacy: parse *all* questions from a full page's text (fallback)."""
     lines = [ln.rstrip() for ln in text.splitlines()]
     buf: list[str] = []
     questions: list[dict] = []
@@ -127,22 +151,17 @@ def parse_page_text(text: str) -> list[dict]:
                         stem_lines.append(ln)
             stem = "\n".join(x for x in stem_lines if x.strip()).strip()
             if options and 1 <= ans <= len(options):
-                questions.append(
-                    {"stem": stem, "options": options, "correctIndex": ans - 1}
-                )
+                questions.append({"stem": stem, "options": options, "correctIndex": ans - 1})
         else:
             buf.append(line)
     return questions
 
 
 # ---------------------------------------------------------------------------
-# Cell detection
+# Cell detection (Russian only)
 # ---------------------------------------------------------------------------
 
-def find_question_cells(page: fitz.Page) -> list[fitz.Rect]:
-    """Return one ``fitz.Rect`` per question cell, sorted top→bottom,
-    left→right.  Each cell is the *smallest* drawing rectangle that
-    contains an 'отв' answer marker."""
+def find_question_cells(page: fitz.Page, ans_search: str) -> list[fitz.Rect]:
     pr = page.rect
     drawings = page.get_drawings()
     all_rects: list[fitz.Rect] = []
@@ -157,16 +176,16 @@ def find_question_cells(page: fitz.Page) -> list[fitz.Rect]:
     if not all_rects:
         return []
 
-    otv_hits = page.search_for("отв")
-    if not otv_hits:
+    ans_hits = page.search_for(ans_search)
+    if not ans_hits:
         return []
 
     seen: set[tuple[int, int, int, int]] = set()
     cells: list[fitz.Rect] = []
 
-    for otv in otv_hits:
-        ox = (otv.x0 + otv.x1) / 2
-        oy = (otv.y0 + otv.y1) / 2
+    for hit in ans_hits:
+        ox = (hit.x0 + hit.x1) / 2
+        oy = (hit.y0 + hit.y1) / 2
         best: fitz.Rect | None = None
         best_area = float("inf")
         for r in all_rects:
@@ -188,18 +207,13 @@ def find_question_cells(page: fitz.Page) -> list[fitz.Rect]:
     return cells
 
 
-# ---------------------------------------------------------------------------
-# Image clipping
-# ---------------------------------------------------------------------------
-
-def cell_clip(page: fitz.Page, cell: fitz.Rect) -> fitz.Rect:
-    """Inset the cell border and cut off the 'отв' answer line."""
+def cell_clip(page: fitz.Page, cell: fitz.Rect, ans_search: str) -> fitz.Rect:
     pr = page.rect
     inset = 3
     clip = fitz.Rect(
         cell.x0 + inset, cell.y0 + inset, cell.x1 - inset, cell.y1 - inset
     )
-    for m in sorted(page.search_for("отв"), key=lambda r: r.y0):
+    for m in sorted(page.search_for(ans_search), key=lambda r: r.y0):
         if cell.x0 <= m.x0 <= cell.x1 and cell.y0 <= m.y0 <= cell.y1:
             cut = m.y0 - 2
             if cut - clip.y0 > 20:
@@ -214,88 +228,145 @@ def cell_clip(page: fitz.Page, cell: fitz.Rect) -> fitz.Rect:
 
 
 # ---------------------------------------------------------------------------
+# Page-flow parsing (non-Russian PDFs)
+# ---------------------------------------------------------------------------
+
+def _parse_opt(line: str, opt_re: re.Pattern) -> tuple[int, str] | None:
+    """LTR option `N.text` → (option_number, text)."""
+    m = opt_re.match(line.strip())
+    if not m:
+        return None
+    num = int(m.group(1))
+    text = m.group(2).strip() if m.lastindex >= 2 else ""
+    return (num, text or str(num))
+
+
+def parse_page_flow(text: str, ans_re: re.Pattern, opt_re: re.Pattern) -> list[dict]:
+    """Parse questions from a page using language-specific markers."""
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    questions: list[dict] = []
+    buf: list[str] = []
+
+    for line in lines:
+        m = ans_re.search(line)
+        if m:
+            ans = int(m.group(1))
+            block = [ln for ln in buf if ln.strip()]
+            buf = []
+            stem_lines: list[str] = []
+            opts: list[tuple[int, str]] = []
+            for ln in block:
+                parsed = _parse_opt(ln, opt_re)
+                if parsed:
+                    opts.append(parsed)
+                elif not opts:
+                    stem_lines.append(ln)
+            opts.sort(key=lambda x: x[0])
+            options = [t for _, t in opts]
+            stem = "\n".join(x for x in stem_lines if x.strip()).strip()
+            if options and 1 <= ans <= len(options):
+                questions.append({"stem": stem, "options": options, "correctIndex": ans - 1})
+        else:
+            buf.append(line)
+
+    return questions
+
+
+# ---------------------------------------------------------------------------
 # Main extraction
 # ---------------------------------------------------------------------------
 
-def extract_from_pdf(pdf_path: Path, dpi: int = 144) -> list[dict]:
+def extract_from_pdf(pdf_path: Path, lang: str = "unknown", dpi: int = 144) -> list[dict]:
+    cfg = LANG_CONFIG.get(lang, LANG_CONFIG["ru"])
+    use_cells  = cfg["use_cells"]
+    ans_search = cfg["ans_search"]
+    ans_re     = cfg["ans_re"]
+    opt_re     = cfg["opt_re"]
+
     out: list[dict] = []
-    pdf_stem = pdf_path.stem
+    pdf_stem   = pdf_path.stem
     source_rel = str(pdf_path.relative_to(PDF_DIR))
     doc = fitz.open(pdf_path)
     mat = fitz.Matrix(dpi / 72, dpi / 72)
 
     for page_index in range(doc.page_count):
-        page = doc.load_page(page_index)
-        cells = find_question_cells(page)
+        page  = doc.load_page(page_index)
+        cells = find_question_cells(page, ans_search) if use_cells else []
+
+        MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
         if cells:
+            # Russian boxed-cell layout
             for cell_idx, cell in enumerate(cells):
-                cell_text = page.get_text("text", clip=cell)
-                q = parse_cell_text(cell_text)
+                q = parse_cell_text(page.get_text("text", clip=cell), ans_re)
                 if q is None:
                     continue
-                clip = cell_clip(page, cell)
-                qid = f"{pdf_stem}-p{page_index}-q{cell_idx}"
-                MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+                qid      = f"{pdf_stem}-p{page_index}-q{cell_idx}"
                 img_name = f"{qid}.png"
-                pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
+                pix = page.get_pixmap(matrix=mat, clip=cell_clip(page, cell, ans_search), alpha=False)
                 pix.save(str(MEDIA_DIR / img_name))
-                out.append(
-                    {
-                        "id": qid,
-                        "source": source_rel,
-                        "page": page_index,
-                        "image": f"media/{img_name}",
-                        "text": q["stem"],
-                        "options": q["options"],
-                        "correctIndex": q["correctIndex"],
-                    }
-                )
+                out.append({
+                    "id": qid, "source": source_rel, "page": page_index,
+                    "image": f"media/{img_name}", "text": q["stem"],
+                    "options": q["options"], "correctIndex": q["correctIndex"],
+                })
         else:
-            qs = parse_page_text(page.get_text())
+            # Page-flow layout (non-Russian)
+            ans_hits = sorted(page.search_for(ans_search), key=lambda r: r.y0)
+            qs       = parse_page_flow(page.get_text(), ans_re, opt_re)
+            pr       = page.rect
+
             for q_idx, q in enumerate(qs):
-                qid = f"{pdf_stem}-p{page_index}-q{q_idx}"
-                clip = page.rect
-                MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+                qid      = f"{pdf_stem}-p{page_index}-q{q_idx}"
                 img_name = f"{qid}.png"
+                # Clip per-question region using answer marker positions
+                if q_idx < len(ans_hits):
+                    y_start = ans_hits[q_idx - 1].y1 + 2 if q_idx > 0 else pr.y0
+                    y_end   = ans_hits[q_idx].y1 + 4
+                    clip    = fitz.Rect(pr.x0, y_start, pr.x1, y_end) & pr
+                else:
+                    clip = pr
                 pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
                 pix.save(str(MEDIA_DIR / img_name))
-                out.append(
-                    {
-                        "id": qid,
-                        "source": source_rel,
-                        "page": page_index,
-                        "image": f"media/{img_name}",
-                        "text": q["stem"],
-                        "options": q["options"],
-                        "correctIndex": q["correctIndex"],
-                    }
-                )
+                out.append({
+                    "id": qid, "source": source_rel, "page": page_index,
+                    "image": f"media/{img_name}", "text": q["stem"],
+                    "options": q["options"], "correctIndex": q["correctIndex"],
+                })
 
     doc.close()
     return out
 
 
 def main() -> None:
+    filter_langs = set(sys.argv[1:])
     pdfs = sorted(PDF_DIR.rglob("*.pdf"))
     if not pdfs:
         print("No PDF files found in", PDF_DIR, file=sys.stderr)
         sys.exit(1)
-    all_q: list[dict] = []
+    by_lang: dict[str, list[dict]] = {}
     for pdf in pdfs:
         if pdf.name.startswith("."):
             continue
         lang = pdf.parent.name if pdf.parent != PDF_DIR else "unknown"
+        if filter_langs and lang not in filter_langs:
+            continue
         print(f"Extracting [{lang}] {pdf.name} ...", flush=True)
-        qs = extract_from_pdf(pdf)
+        qs = extract_from_pdf(pdf, lang)
         for q in qs:
             q["lang"] = lang
-        all_q.extend(qs)
-    payload = {"version": 1, "count": len(all_q), "questions": all_q}
-    OUT_JSON.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    print("Wrote", OUT_JSON, "with", len(all_q), "questions")
+        by_lang.setdefault(lang, []).extend(qs)
+    if not by_lang:
+        print("No languages extracted.", file=sys.stderr)
+        sys.exit(1)
+    QUESTIONS_DIR.mkdir(exist_ok=True)
+    for lang, qs in sorted(by_lang.items()):
+        path = QUESTIONS_DIR / f"{lang}.json"
+        path.write_text(
+            json.dumps({"version": 1, "count": len(qs), "questions": qs}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Wrote {path} with {len(qs)} questions")
 
 
 if __name__ == "__main__":

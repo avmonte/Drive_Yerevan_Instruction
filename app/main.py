@@ -19,7 +19,8 @@ from openai import AsyncOpenAI
 load_dotenv()
 
 ROOT = Path(__file__).resolve().parent.parent
-QUESTIONS_PATH = ROOT / "questions.json"
+QUESTIONS_DIR = ROOT / "questions"
+DEFAULT_LANG = os.getenv("DEFAULT_LANG", "")
 PROGRESS_PATH = ROOT / "progress.json"
 PROBLEMS_PATH = ROOT / "problems.json"
 BALANCER_PATH = ROOT / "balancer.json"
@@ -34,41 +35,47 @@ EXAM_PASS = 18
 
 app = FastAPI(title="Road exam quiz")
 
-_questions: list[dict] = []
 _by_id: dict[str, dict] = {}
 _by_lang: dict[str, list[dict]] = {}
 _lang_index: dict[str, dict[str, int]] = {}
-_available_langs: list[str] = []
 _exam: dict[str, Any] | None = None
 
 
-def load_questions() -> None:
-    global _questions, _by_id, _by_lang, _lang_index, _available_langs
-    if not QUESTIONS_PATH.is_file():
-        raise RuntimeError(
-            f"Missing {QUESTIONS_PATH.name}. Run: python extract_questions.py"
-        )
-    data = json.loads(QUESTIONS_PATH.read_text(encoding="utf-8"))
-    _questions = data.get("questions", [])
-    _by_id = {q["id"]: q for q in _questions}
-    _by_lang = {}
-    for q in _questions:
-        _by_lang.setdefault(q.get("lang", "unknown"), []).append(q)
-    _available_langs = sorted(_by_lang.keys())
-    _lang_index = {}
-    for lang, qs in _by_lang.items():
-        _lang_index[lang] = {q["id"]: i for i, q in enumerate(qs)}
+def _available_langs() -> list[str]:
+    if not QUESTIONS_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in QUESTIONS_DIR.glob("*.json"))
+
+
+def _load_lang(lang: str) -> None:
+    if lang in _by_lang:
+        return
+    path = QUESTIONS_DIR / f"{lang}.json"
+    if not path.is_file():
+        raise HTTPException(404, f"Language '{lang}' not available")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    qs = data.get("questions", [])
+    _by_lang[lang] = qs
+    _lang_index[lang] = {q["id"]: i for i, q in enumerate(qs)}
+    _by_id.update({q["id"]: q for q in qs})
 
 
 def _pool(lang: str | None = None) -> list[dict]:
-    if lang and lang in _by_lang:
-        return _by_lang[lang]
-    return _questions
+    if lang:
+        _load_lang(lang)
+        return _by_lang.get(lang, [])
+    for l in _available_langs():
+        try:
+            _load_lang(l)
+        except HTTPException:
+            pass
+    return [q for qs in _by_lang.values() for q in qs]
 
 
 def _qindex(q: dict, lang: str | None = None) -> int:
-    if lang and lang in _lang_index:
-        return _lang_index[lang].get(q["id"], -1)
+    l = lang or q.get("lang")
+    if l and l in _lang_index:
+        return _lang_index[l].get(q["id"], -1)
     return -1
 
 
@@ -122,7 +129,10 @@ def _atomic_write(path: Path, obj: Any) -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    load_questions()
+    if not QUESTIONS_DIR.is_dir():
+        raise RuntimeError("Missing questions/ directory. Run: python extract_questions.py")
+    if DEFAULT_LANG and (QUESTIONS_DIR / f"{DEFAULT_LANG}.json").is_file():
+        _load_lang(DEFAULT_LANG)
 
 
 class AnswerBody(BaseModel):
@@ -189,7 +199,7 @@ def _record_answer(qid: str, choice: int, ok: bool) -> None:
 
 @app.get("/api/languages")
 def get_languages() -> dict:
-    return {"languages": _available_langs}
+    return {"languages": _available_langs()}
 
 
 # ---- Practice mode ----
@@ -226,6 +236,12 @@ def get_question_at(index: int, lang: str = Query("")) -> dict:
 
 @app.get("/api/question/{qid}")
 def get_one(qid: str) -> dict:
+    if qid not in _by_id:
+        for lang in _available_langs():
+            try:
+                _load_lang(lang)
+            except HTTPException:
+                pass
     q = _by_id.get(qid)
     if not q:
         raise HTTPException(404, "Unknown question")

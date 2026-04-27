@@ -6,3 +6,4 @@ problems.json
 balancer.json
 .DS_Store
 .env
+.idea/
