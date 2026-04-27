@@ -463,7 +463,7 @@ def complicated_question(lang: str = Query("")) -> dict:
     probs = load_problems()
     candidates = [_by_id[qid] for qid in probs if qid in _by_id and qid in pool_ids]
     if not candidates:
-        raise HTTPException(404, "Нет сложных вопросов")
+        raise HTTPException(404, "No hard questions")
     return _question_payload(random.choice(candidates), lang or None)
 
 
@@ -475,7 +475,7 @@ def balancer_question(lang: str = Query("")) -> dict:
     bal = load_balancer()
     filtered = [qid for qid in bal if qid in pool_ids and qid in _by_id]
     if not filtered:
-        raise HTTPException(404, "Балансир пуст — ошибок ещё нет")
+        raise HTTPException(404, "Balancer is empty")
     qid = random.choice(filtered)
     return _question_payload(_by_id[qid], lang or None)
 
@@ -539,18 +539,38 @@ async def explain_question(body: dict) -> dict:
 
     text = q["text"]
     options = q["options"]
-    prompt = (
-        "Это вопрос экзамена по ПДД Республики Армения. "
-        "При ответе опирайся в первую очередь на армянскую редакцию ПДД, "
-        "а не на российскую.\n\n"
-        f"Вопрос:\n{text}\n\nВарианты ответов:\n"
-    )
-    for i, opt in enumerate(options, 1):
-        prompt += f"{i}. {opt}\n"
-    prompt += (
-        f"\nПравильный ответ: {q['correctIndex'] + 1}. "
-        f"{options[q['correctIndex']]}\n"
-        "\nОбъясни, почему этот ответ правильный. Ответь на русском языке."
+    lang = q.get("lang", "ru")
+
+    _PROMPT_TEMPLATES = {
+        "ru": (
+            "Это вопрос экзамена по ПДД Республики Армения. "
+            "При ответе опирайся на армянскую редакцию ПДД.\n\n"
+            "Вопрос:\n{text}\n\nВарианты ответов:\n{opts}\n"
+            "Правильный ответ: {idx}. {answer}\n\n"
+            "Объясни, почему этот ответ правильный. Ответь на русском языке."
+        ),
+        "en": (
+            "This is an Armenian road exam question. "
+            "Base your explanation on Armenian traffic rules.\n\n"
+            "Question:\n{text}\n\nAnswer options:\n{opts}\n"
+            "Correct answer: {idx}. {answer}\n\n"
+            "Explain why this answer is correct. Answer in English."
+        ),
+        "am": (
+            "Սա Հայաստանի ճանապարհային քննության հարց է: "
+            "Պատասխանելիս հիմնվիր Հայաստանի ճանապարհային կանոնների վրա:\n\n"
+            "Հարց:\n{text}\n\nՊատասխանների տարբերակներ:\n{opts}\n"
+            "Ճիշտ պատասխան: {idx}. {answer}\n\n"
+            "Բացատրիր, թե ինչու է այս պատասխանը ճիշտ: Պատասխանիր հայերեն:"
+        ),
+    }
+    template = _PROMPT_TEMPLATES.get(lang, _PROMPT_TEMPLATES["ru"])
+    opts_str = "".join(f"{i}. {opt}\n" for i, opt in enumerate(options, 1))
+    prompt = template.format(
+        text=text,
+        opts=opts_str,
+        idx=q["correctIndex"] + 1,
+        answer=options[q["correctIndex"]],
     )
 
     content: list[dict] = []
@@ -558,19 +578,11 @@ async def explain_question(body: dict) -> dict:
     image_path = ROOT / image_file if image_file else None
     if image_path and image_path.is_file():
         img_data = base64.b64encode(image_path.read_bytes()).decode()
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{img_data}"},
-            }
-        )
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}})
     content.append({"type": "text", "text": prompt})
 
     try:
-        client = AsyncOpenAI(
-            api_key=LLM_API_KEY,
-            base_url=LLM_BASE_URL,
-        )
+        client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
         response = await client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": content}],

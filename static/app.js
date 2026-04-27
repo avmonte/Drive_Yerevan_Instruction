@@ -690,6 +690,8 @@ document.getElementById("balExplainBtn").addEventListener("click", () => {
 });
 
 
+const LANG_NAMES = { am: "Հայերեն", ru: "Русский", en: "English" };
+
 /* ---- Language selector ---- */
 async function loadLanguages() {
   const r = await fetch("/api/languages");
@@ -699,7 +701,7 @@ async function loadLanguages() {
   d.languages.forEach(lang => {
     const opt = document.createElement("option");
     opt.value = lang;
-    opt.textContent = lang.toUpperCase();
+    opt.textContent = LANG_NAMES[lang] || lang.toUpperCase();
     sel.appendChild(opt);
   });
   if (currentLang && d.languages.includes(currentLang)) {
